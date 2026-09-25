@@ -72,14 +72,16 @@ class TestAscendConfig(unittest.TestCase):
         eplb_config = init_ascend_config(self.vllm_config).eplb_config
         _, expert_map, log2phy, redundant_experts, _ = init_eplb_config(eplb_config, 0, self.moe_config)
         logical_topk_ids = torch.tensor([[0, 1], [2, 3]], dtype=torch.int64)
-        physical_topk_ids = log2phy[logical_topk_ids]
+        # Index on the map's own device: the map is on the execution device
+        # while log2phy may be CPU under the npu no-op patch.
+        physical_topk_ids = log2phy[logical_topk_ids].to(expert_map.device)
 
         self.assertTrue(torch.all(physical_topk_ids < expert_map.numel()))
         self.assertEqual(int(log2phy.max()), expert_map.numel() - 1)
         mask = expert_map[physical_topk_ids] != -1
         self.assertEqual(mask.shape, (2, 2))
         # rank 1 owns physical experts 5..9; logical 0,1 replicate there.
-        self.assertTrue(torch.equal(mask, torch.tensor([[True, True], [False, False]])))
+        self.assertTrue(torch.equal(mask.cpu(), torch.tensor([[True, True], [False, False]])))
         self.assertEqual(redundant_experts, 2)
 
     def test_generate_global_placement_matches_vllm_physical_layout(self):
