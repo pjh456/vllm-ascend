@@ -130,7 +130,11 @@ class AscendGemmaRMSNorm(GemmaRMSNorm):
 
     def _folded_weight(self) -> torch.Tensor:
         folded = getattr(self, "gemma_weight_plus_one", None)
-        return self.weight if folded is None else folded
+        if folded is not None:
+            return folded
+        # Never drop the offset: this fallback must stay numerically identical to
+        # the folded buffer, it only gives up the optimisation.
+        return 1.0 + self.weight
 
 
 def fold_gemma_rmsnorm_weight(model: torch.nn.Module) -> int:
@@ -144,7 +148,11 @@ def fold_gemma_rmsnorm_weight(model: torch.nn.Module) -> int:
     """
     folded = 0
     for module in model.modules():
-        if not isinstance(module, AscendGemmaRMSNorm):
+        # vLLM may instantiate the out-of-tree class directly or dispatch
+        # ``forward_oot`` on the in-tree class, so match both.
+        if type(module).__name__ not in ("GemmaRMSNorm", "AscendGemmaRMSNorm"):
+            continue
+        if not hasattr(module, "weight") or module.weight.ndim != 1:
             continue
         if getattr(module, "gemma_weight_plus_one", None) is not None:
             continue

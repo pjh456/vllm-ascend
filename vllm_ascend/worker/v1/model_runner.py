@@ -4717,7 +4717,8 @@ class NPUModelRunner(GPUModelRunner):
                 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
                 DefaultModelLoader._init_ep_weight_filter = mock_pass
             self.model: nn.Module = get_model(vllm_config=self.vllm_config)
-            fold_gemma_rmsnorm_weight(self.model)
+            folded_norms = fold_gemma_rmsnorm_weight(self.model)
+            logger.info("Folded the weight offset of %d Gemma RMSNorm layers", folded_norms)
             for name, _ in self.model.named_parameters():
                 # sinks is a kind of parameter in attention
                 # only set in weight name
