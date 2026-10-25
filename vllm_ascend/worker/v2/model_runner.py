@@ -98,6 +98,7 @@ from vllm_ascend.observability.runtime_guard.hooks import (
     runtime_guard_step,
 )
 from vllm_ascend.observability.runtime_guard.processor import RuntimeGuardProcessor
+from vllm_ascend.ops.layernorm import fold_gemma_rmsnorm_weight
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.utils import (
     is_c8_mxfp_kv_quant,
@@ -307,6 +308,10 @@ class NPUModelRunner(GPUModelRunner):
             aux_layers = get_pd_dspark_aux_layer_ids(self.vllm_config)
             super().load_model(load_dummy_weights, *args, **kwargs)
             self.pd_dspark_aux_layer_ids = aux_layers
+            # ``1 + weight`` is constant for Gemma-style norms; materialise it once
+            # here instead of letting it run per layer on every decode step.
+            folded_norms = fold_gemma_rmsnorm_weight(self.model)
+            logger.info("Folded the weight offset of %d Gemma RMSNorm layers", folded_norms)
         finally:
             # Join even when weight loading fails: these threads touch the NPU
             # device and must not outlive this call. Joining here is also before
