@@ -109,18 +109,52 @@ class AscendGemmaRMSNorm(GemmaRMSNorm):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         import torch_npu
 
+        # ``1 + weight`` is constant; fold_gemma_rmsnorm_weight() materialises it
+        # once after loading instead of recomputing it in every forward, where it
+        # would otherwise become a small ``add`` kernel per layer in the graph.
+        weight = self._folded_weight()
         if residual is not None:
             if enable_custom_op():
                 x, _, residual = torch.ops._C_ascend.npu_add_rms_norm_bias(
-                    x, residual, 1.0 + self.weight, None, self.variance_epsilon
+                    x, residual, weight, None, self.variance_epsilon
                 )
             else:
-                x, _, residual = torch_npu.npu_add_rms_norm(x, residual, 1.0 + self.weight, self.variance_epsilon)
+                x, _, residual = torch_npu.npu_add_rms_norm(x, residual, weight, self.variance_epsilon)
             return x, residual
 
+        # npu_gemma_rms_norm applies ``1 + weight`` internally, so it keeps the
+        # raw parameter.
         x = DeviceOperator.npu_gemma_rms_norm(x, self.weight, self.variance_epsilon)
 
         return x
+
+    def _folded_weight(self) -> torch.Tensor:
+        folded = getattr(self, "gemma_weight_plus_one", None)
+        return self.weight if folded is None else folded
+
+
+def fold_gemma_rmsnorm_weight(model: torch.nn.Module) -> int:
+    """Precompute ``1 + weight`` for every Gemma-style RMSNorm in ``model``.
+
+    ``GemmaRMSNorm`` scales its input by ``1 + weight``. When that expression is
+    evaluated inside the forward it lands in the compiled graph as an ``add`` of
+    the norm weight, which then executes once per norm layer on every decode
+    step even though both operands are constant. Folding it after the weights are
+    loaded removes those kernels without changing the numerics.
+    """
+    folded = 0
+    for module in model.modules():
+        if not isinstance(module, AscendGemmaRMSNorm):
+            continue
+        if getattr(module, "gemma_weight_plus_one", None) is not None:
+            continue
+        module.register_buffer(
+            "gemma_weight_plus_one",
+            (module.weight.detach() + 1.0).contiguous(),
+            persistent=False,
+        )
+        folded += 1
+    return folded
 
 
 class LayerNormFn(torch.autograd.Function):
