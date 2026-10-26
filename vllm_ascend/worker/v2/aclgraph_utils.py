@@ -47,6 +47,7 @@ from vllm_ascend.compilation.updatable_graph import (
     GRAPH_UPDATE_STATS,
     ContextSource,
     UpdatableGraph,
+    begin_update_barrier,
 )
 from vllm_ascend.utils import use_updatable_graph
 from vllm_ascend.worker.v2.utils import communicator_switch
@@ -200,11 +201,11 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         resolved_tasks = graph.resolve_tasks(ContextSource(attn_metadata))
         if stats.enabled:
             t1 = time.perf_counter()
-        self.update_stream.wait_stream(torch.npu.current_stream())
+        wait_event = begin_update_barrier(self.update_stream)
         ret = super().run_fullgraph(desc)
         if stats.enabled:
             t2 = time.perf_counter()
-        graph.update(self.update_stream, resolved_tasks)
+        graph.update(self.update_stream, resolved_tasks, wait_event)
         if stats.enabled:
             stats.add_step(t1 - t0, time.perf_counter() - t2)
         return ret
