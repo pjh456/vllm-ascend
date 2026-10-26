@@ -45,6 +45,7 @@ from vllm_ascend.compilation.breakable_aclgraph import BreakableACLGraphWrapper
 from vllm_ascend.compilation.updatable_graph import (
     ContextSource,
     UpdatableGraph,
+    begin_update_barrier,
 )
 from vllm_ascend.utils import use_updatable_graph
 from vllm_ascend.worker.v2.utils import communicator_switch
@@ -193,9 +194,9 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         graph = self.graphs[desc]
         assert isinstance(graph, UpdatableGraph)
         resolved_tasks = graph.resolve_tasks(ContextSource(attn_metadata))
-        self.update_stream.wait_stream(torch.npu.current_stream())
+        wait_event = begin_update_barrier(self.update_stream)
         ret = super().run_fullgraph(desc)
-        graph.update(self.update_stream, resolved_tasks)
+        graph.update(self.update_stream, resolved_tasks, wait_event)
         return ret
 
     def capture(
