@@ -68,6 +68,22 @@ def test_disabled_does_not_log_or_reset():
         assert stats.steps == 1
 
 
+def test_reporting_switches_itself_off_after_max_reports():
+    stats = GraphUpdateStats(enabled=True)
+    stats.LOG_EVERY_STEPS = 1
+    stats.MAX_REPORTS = 2
+
+    with patch("vllm_ascend.compilation.updatable_graph.logger") as fake_logger:
+        for _ in range(2):
+            stats.add_step(0.001, 0.005)
+        assert fake_logger.info.call_count == 2
+        assert stats.enabled is False
+
+        # No further accounting once the report budget is exhausted.
+        stats.add_step(0.001, 0.005)
+        assert fake_logger.info.call_count == 2
+
+
 def test_phase_totals_are_reported_separately():
     stats = GraphUpdateStats(enabled=True)
     stats.tasks = 16
