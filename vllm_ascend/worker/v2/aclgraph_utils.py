@@ -16,6 +16,7 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 #
+import time
 from collections.abc import Callable
 from contextlib import contextmanager
 from functools import partial
@@ -48,6 +49,7 @@ from vllm_ascend.compilation.acl_graph import (
 )
 from vllm_ascend.compilation.breakable_aclgraph import BreakableACLGraphWrapper
 from vllm_ascend.compilation.updatable_graph import (
+    GRAPH_UPDATE_STATS,
     ContextSource,
     UpdatableGraph,
 )
@@ -250,10 +252,19 @@ class ModelAclGraphManager(ModelCudaGraphManager):
     def _updatable_graph_replay(self, desc, attn_metadata):
         graph = self.graphs[desc]
         assert isinstance(graph, UpdatableGraph)
+        stats = GRAPH_UPDATE_STATS
+        if stats.enabled:
+            t0 = time.perf_counter()
         resolved_tasks = graph.resolve_tasks(ContextSource(attn_metadata))
+        if stats.enabled:
+            t1 = time.perf_counter()
         self.update_stream.wait_stream(torch.npu.current_stream())
         ret = super().run_fullgraph(desc)
+        if stats.enabled:
+            t2 = time.perf_counter()
         graph.update(self.update_stream, resolved_tasks)
+        if stats.enabled:
+            stats.add_step(t1 - t0, time.perf_counter() - t2)
         return ret
 
     def capture(
