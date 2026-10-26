@@ -37,11 +37,7 @@ from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_ascend._310p.worker.v2.spec_utils import set_draft_step_host
-from vllm_ascend.compilation.updatable_graph import (
-    SharedSource,
-    UpdatableGraph,
-    begin_update_barrier,
-)
+from vllm_ascend.compilation.updatable_graph import SharedSource, UpdatableGraph
 from vllm_ascend.worker.v2.aclgraph_utils import model_capture_wrapper
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch
 from vllm_ascend.worker.v2.spec_decode.autoregressive.aclgraph import (
@@ -69,11 +65,12 @@ class AutoRegressiveAclGraphManager310(AutoRegressiveAclGraphManager):
         )
         resolved_tasks = graph.resolve_tasks(SharedSource(fia_params))
         # Empty tasks (typical on 310P): no host-side graph update work.
-        wait_event = begin_update_barrier(self.update_stream) if resolved_tasks else None
+        if resolved_tasks:
+            self.update_stream.wait_stream(torch.npu.current_stream())
         # Skip AutoRegressiveAclGraphManager.run_fullgraph (would recurse).
         ret = super(AutoRegressiveAclGraphManager, self).run_fullgraph(desc)
         if resolved_tasks:
-            graph.update(self.update_stream, resolved_tasks, wait_event)
+            graph.update(self.update_stream, resolved_tasks)
         return ret
 
     def capture(

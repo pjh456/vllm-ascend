@@ -20,6 +20,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
+import torch
 import torch.nn as nn
 from vllm.sequence import IntermediateTensors
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -29,11 +30,7 @@ from vllm.v1.worker.gpu.input_batch import InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.utils import AttentionGroup
 
-from vllm_ascend.compilation.updatable_graph import (
-    ContextSource,
-    UpdatableGraph,
-    begin_update_barrier,
-)
+from vllm_ascend.compilation.updatable_graph import ContextSource, UpdatableGraph
 from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch
 
@@ -49,10 +46,11 @@ class ModelAclGraphManager310(ModelAclGraphManager):
         # 310P SpecDecoding FULL refreshes capture-stable buffers on the compute
         # stream and registers no FIA/PA graph_task. An empty task list means
         # update_stream is idle — skip the handshake (major MTP tax on 2B).
-        wait_event = begin_update_barrier(self.update_stream) if resolved_tasks else None
+        if resolved_tasks:
+            self.update_stream.wait_stream(torch.npu.current_stream())
         ret = super(ModelAclGraphManager, self).run_fullgraph(desc)
         if resolved_tasks:
-            graph.update(self.update_stream, resolved_tasks, wait_event)
+            graph.update(self.update_stream, resolved_tasks)
         return ret
 
     def capture(
