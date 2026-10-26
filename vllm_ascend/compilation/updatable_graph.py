@@ -27,9 +27,11 @@ class GraphUpdateStats:
     """
 
     LOG_EVERY_STEPS = 100
+    MAX_REPORTS = 5
 
     def __init__(self, enabled: bool | None = None) -> None:
         self.enabled = envs.VLLM_ASCEND_GRAPH_UPDATE_PROFILE if enabled is None else enabled
+        self.reports = 0
         self._clear()
 
     def _clear(self) -> None:
@@ -65,6 +67,11 @@ class GraphUpdateStats:
             1e3 * self.end_s / n,
             1e3 * self.record_s / n,
         )
+        self.reports += 1
+        if self.reports >= self.MAX_REPORTS:
+            # Bounded output: a profiling build must not keep logging forever
+            # if the switch is left on by accident.
+            self.enabled = False
         self._clear()
 
 
