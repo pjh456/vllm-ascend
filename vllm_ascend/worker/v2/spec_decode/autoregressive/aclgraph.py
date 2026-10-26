@@ -28,6 +28,7 @@ from vllm_ascend.compilation.acl_graph import (
 from vllm_ascend.compilation.updatable_graph import (
     SharedSource,
     UpdatableGraph,
+    begin_update_barrier,
 )
 from vllm_ascend.utils import use_updatable_graph, vllm_version_is
 from vllm_ascend.worker.v2.aclgraph_utils import (
@@ -218,7 +219,7 @@ class AutoRegressiveAclGraphManager(SpeculatorCudaGraphManager):
             self.is_draft_model_prefill,
         )
         resolved_tasks = graph.resolve_tasks(SharedSource(fia_params))
-        self.update_stream.wait_stream(torch.npu.current_stream())
+        wait_event = begin_update_barrier(self.update_stream)
         ret = super().run_fullgraph(desc)
-        graph.update(self.update_stream, resolved_tasks)
+        graph.update(self.update_stream, resolved_tasks, wait_event)
         return ret

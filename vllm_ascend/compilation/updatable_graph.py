@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import queue
+import threading
 import time
 from collections.abc import Callable, Hashable, Sequence
 from contextvars import ContextVar, Token
@@ -156,6 +158,95 @@ class GraphUpdateTask:
         self.event.record(update_stream)
 
 
+class GraphUpdateExecutor:
+    """Apply ``UpdatableGraph`` parameter updates off the model-runner thread.
+
+    The V2 model runner re-issues every captured attention op on each replay
+    (tiling is host side, so the lengths cannot be frozen into the graph). With
+    16 full-attention layers that is roughly 7 ms of host work per decode step,
+    which competes with the preparation of the next step and leaves visible
+    bubbles on the device.
+
+    That work only has to finish before the replayed graph reaches the matching
+    attention node, and the per-task events already enforce exactly that
+    ordering, so it does not have to run on the thread that drives the step.
+    Submitting it to a worker thread keeps the critical path short.
+
+    Thread-safety: the update stream is used by the worker only. The
+    model-runner thread orders the stream through :func:`begin_update_barrier`,
+    which records an event instead of touching the stream.
+    """
+
+    def __init__(self) -> None:
+        self._queue: queue.Queue = queue.Queue()
+        self._thread: threading.Thread | None = None
+        self._error: BaseException | None = None
+
+    def submit(
+        self,
+        graph: "UpdatableGraph",
+        update_stream: Any,
+        resolved_tasks: tuple["GraphUpdateTask", ...],
+        wait_event: Any,
+    ) -> None:
+        self._raise_if_failed()
+        if self._thread is None:
+            self._thread = threading.Thread(
+                target=self._run,
+                name="ascend-graph-update",
+                daemon=True,
+            )
+            self._thread.start()
+        self._queue.put((graph, update_stream, resolved_tasks, wait_event))
+
+    def wait_idle(self) -> None:
+        """Block until all submitted updates have been applied."""
+        self._queue.join()
+        self._raise_if_failed()
+
+    def _raise_if_failed(self) -> None:
+        if self._error is not None:
+            raise RuntimeError("UpdatableGraph worker thread failed") from self._error
+
+    def _run(self) -> None:
+        while True:
+            graph, update_stream, resolved_tasks, wait_event = self._queue.get()
+            try:
+                graph.apply_update(update_stream, resolved_tasks, wait_event)
+            except BaseException as exc:  # noqa: BLE001 - re-raised on submit
+                # The captured events are then never recorded, so the next
+                # replay stops at its first attention node instead of silently
+                # running with stale parameters. Surface the failure on the
+                # model-runner thread at the next submit.
+                self._error = exc
+                logger.exception("UpdatableGraph worker failed to apply an update")
+            finally:
+                self._queue.task_done()
+
+
+GRAPH_UPDATE_EXECUTOR = GraphUpdateExecutor()
+
+
+def begin_update_barrier(update_stream: Any) -> Any:
+    """Order the pending update against the model-runner stream.
+
+    Inline updates keep the original ``wait_stream`` guarantee: the update runs
+    after everything the model-runner stream has enqueued so far, and therefore
+    concurrently with the replay launched right afterwards.
+
+    The pipelined path records an event carrying the same ordering. It must not
+    enqueue to the update stream, because that stream belongs to the worker
+    thread once updates are submitted asynchronously.
+    """
+    stream = torch.npu.current_stream()
+    if not envs.VLLM_ASCEND_GRAPH_UPDATE_ASYNC:
+        update_stream.wait_stream(stream)
+        return None
+    event = torch.npu.Event()
+    event.record(stream)
+    return event
+
+
 class UpdatableGraph(torch.npu.NPUGraph):
     def __init__(self) -> None:
         super().__init__()
@@ -242,8 +333,25 @@ class UpdatableGraph(torch.npu.NPUGraph):
         self,
         update_stream,
         resolved_tasks: tuple[GraphUpdateTask, ...],
+        wait_event: Any = None,
+    ) -> None:
+        if envs.VLLM_ASCEND_GRAPH_UPDATE_ASYNC:
+            GRAPH_UPDATE_EXECUTOR.submit(self, update_stream, resolved_tasks, wait_event)
+            return
+        self.apply_update(update_stream, resolved_tasks, wait_event)
+
+    def apply_update(
+        self,
+        update_stream,
+        resolved_tasks: tuple[GraphUpdateTask, ...],
+        wait_event: Any = None,
     ) -> None:
         logger.debug_once("Updating host-side attention metadata with UpdatableGraph.")
+        if wait_event is not None:
+            # Enter the update stream only after the model-runner stream reached
+            # the point recorded by the barrier event, so this update cannot
+            # race ahead of the replay that still reads the previous parameters.
+            wait_event.wait(update_stream)
         with torch.npu.stream(update_stream):
             # This is specially designed for PA.
             ws_buffer: dict[Hashable, Any] = {}

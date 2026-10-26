@@ -82,6 +82,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     # without a per-step UpdatableGraph parameter update. Default is 0
     # (disabled) while it is being validated.
     "VLLM_ASCEND_STABLE_ATTN_METADATA": lambda: bool(int(os.getenv("VLLM_ASCEND_STABLE_ATTN_METADATA", "0"))),
+    # Apply the per-step UpdatableGraph parameter update on a dedicated worker
+    # thread instead of the model-runner thread. The re-parameterization only
+    # has to finish before the replayed graph reaches the matching attention
+    # node, so running it off the critical path keeps the next decode step's
+    # host budget below the device execution time. Default is 0 (inline
+    # update, the original behaviour).
+    "VLLM_ASCEND_GRAPH_UPDATE_ASYNC": lambda: bool(int(os.getenv("VLLM_ASCEND_GRAPH_UPDATE_ASYNC", "0"))),
 }
 
 # end-env-vars-definition

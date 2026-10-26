@@ -22,6 +22,7 @@ from vllm_ascend.compilation.acl_graph import (
 from vllm_ascend.compilation.updatable_graph import (
     ContextSource,
     UpdatableGraph,
+    begin_update_barrier,
 )
 from vllm_ascend.utils import use_updatable_graph, vllm_version_is
 from vllm_ascend.worker.v2.aclgraph_utils import collect_sorted_captured_token_sizes, model_capture_wrapper
@@ -145,7 +146,7 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
         graph = self.graphs[desc]
         assert isinstance(graph, UpdatableGraph)
         resolved_tasks = graph.resolve_tasks(ContextSource(draft_attn_metadatas[0]))
-        self.update_stream.wait_stream(torch.npu.current_stream())
+        wait_event = begin_update_barrier(self.update_stream)
         ret = super().run_fullgraph(desc)
-        graph.update(self.update_stream, resolved_tasks)
+        graph.update(self.update_stream, resolved_tasks, wait_event)
         return ret
