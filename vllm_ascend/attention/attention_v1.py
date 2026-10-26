@@ -42,6 +42,7 @@ from vllm.v1.attention.ops.pcp import _gather_prefill_cache_inputs  # type: igno
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import AttentionSpec, CrossAttentionSpec
 
+from vllm_ascend import envs
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.context_parallel.common_cp import (
@@ -162,6 +163,48 @@ class AscendAttentionState(Enum):
     SpecDecoding = 4
 
 
+class _StableGraphBuffers:
+    """Fixed-address FIA length arguments for the FULL-graph decode path.
+
+    ``UpdatableGraph`` re-issues every captured attention op on each replay
+    because the arguments it was captured with (``actual_seq_lengths`` and
+    ``actual_seq_lengths_kv``) are rebuilt as Python lists every step, which
+    gives the op fresh addresses. Writing them into buffers that never move
+    keeps the captured addresses valid, so the op can be replayed as-is and no
+    parameter update is needed.
+    """
+
+    def __init__(self, device: torch.device, capacity: int, max_blocks: int) -> None:
+        self.device = device
+        self.capacity = capacity
+        self.max_blocks = max_blocks
+        self.q_lens = torch.zeros(capacity, dtype=torch.int32, device=device)
+        # Padding rows stand for the synthetic request appended by ``build``;
+        # any positive KV length is valid for it (its output is trimmed later).
+        self.kv_lens = torch.ones(capacity, dtype=torch.int32, device=device)
+        # Its block table row stays all-zero, i.e. it points at block 0.
+        self.block_table = torch.zeros((capacity, max_blocks), dtype=torch.int32, device=device)
+
+    def fill(
+        self,
+        q_lens: list[int],
+        kv_lens: list[int],
+        block_table: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        count = len(q_lens)
+        if count > self.capacity:
+            return None
+        self.q_lens[:count].copy_(torch.tensor(q_lens, dtype=torch.int32, device=self.device))
+        kept_kv = min(len(kv_lens), count)
+        if kept_kv:
+            self.kv_lens[:kept_kv].copy_(torch.tensor(kv_lens[:kept_kv], dtype=torch.int32, device=self.device))
+        if block_table is not None:
+            kept_bt = min(block_table.shape[0], count)
+            if kept_bt:
+                self.block_table[:kept_bt].copy_(block_table[:kept_bt])
+        return self.q_lens[:count], self.kv_lens[:count], self.block_table[:count]
+
+
 @dataclass
 class AscendMetadata:
     """
@@ -193,6 +236,13 @@ class AscendMetadata:
     seq_lens_cpu: torch.Tensor = None
     seq_lens_list: list[int] = None  # type: ignore
     actual_seq_lengths_q: list[int] = None  # type: ignore
+
+    # Fixed-address variants of the two length arguments above, plus the block
+    # table, used when VLLM_ASCEND_STABLE_ATTN_METADATA is on. When they are
+    # set the captured FIA node needs no per-replay parameter update.
+    graph_q_lens: torch.Tensor = None
+    graph_kv_lens: torch.Tensor = None
+    graph_block_table: torch.Tensor = None
 
     query_start_loc: torch.Tensor = None
     # Maximum query length in the batch (None for decoding).
@@ -286,6 +336,25 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         scheduler_config = vllm_config.scheduler_config
         self.chunked_prefill_enabled = scheduler_config.enable_chunked_prefill
         self.attn_mask_builder = AttentionMaskBuilder(self.device)
+
+        # Opt-in: hand the FIA length arguments to the graph as fixed-address
+        # buffers so the captured node never needs a parameter update.
+        self._stable_graph_metadata = envs.VLLM_ASCEND_STABLE_ATTN_METADATA
+        self._stable_graph_buffers: _StableGraphBuffers | None = None
+        # +2 covers the synthetic padding request `build` may append.
+        self._stable_graph_capacity = scheduler_config.max_num_seqs + 2
+
+    def _get_stable_graph_buffers(self, block_table: torch.Tensor | None) -> _StableGraphBuffers | None:
+        if block_table is None or self.pcp_enabled:
+            return None
+        max_blocks = block_table.shape[1]
+        if self._stable_graph_buffers is None or self._stable_graph_buffers.max_blocks < max_blocks:
+            self._stable_graph_buffers = _StableGraphBuffers(
+                self.device,
+                self._stable_graph_capacity,
+                max_blocks,
+            )
+        return self._stable_graph_buffers
 
     @classmethod
     def get_cudagraph_support(
@@ -443,6 +512,18 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             num_decodes=num_decodes,
             num_prefills=num_prefills,
         )
+
+        graph_q_lens = graph_kv_lens = graph_block_table = None
+        if self._stable_graph_metadata and attn_state in (
+            AscendAttentionState.DecodeOnly,
+            AscendAttentionState.SpecDecoding,
+        ):
+            stable_buffers = self._get_stable_graph_buffers(block_table)
+            if stable_buffers is not None:
+                filled = stable_buffers.fill(actual_seq_lengths_q, seq_lens_list, block_table)
+                if filled is not None:
+                    graph_q_lens, graph_kv_lens, graph_block_table = filled
+
         attn_metadata = self.metadata_cls(
             num_actual_tokens=num_actual_tokens,
             num_decode_tokens=num_decode_tokens,
@@ -462,6 +543,9 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             num_decodes=num_decodes,
             causal=common_attn_metadata.causal,
             model_runner_type=self.model_config.runner_type,
+            graph_q_lens=graph_q_lens,
+            graph_kv_lens=graph_kv_lens,
+            graph_block_table=graph_block_table,
             **backend_metadata,
         )
         if pcp_shard_slot_mapping is not None:
@@ -524,17 +608,24 @@ class FIAParamProvider:
 
     def resolve(self, attn_metadata) -> dict[str, Any]:
         metadata = attn_metadata[self.layer_name]
+        q_lens = metadata.graph_q_lens if metadata.graph_q_lens is not None else metadata.actual_seq_lengths_q
+        kv_lens = metadata.graph_kv_lens if metadata.graph_kv_lens is not None else metadata.seq_lens_list
 
         if self.is_draft_model or not self.sliding_window:
+            block_table = None
+            if not self.is_non_pa:
+                block_table = (
+                    metadata.graph_block_table if metadata.graph_block_table is not None else metadata.block_tables
+                )
             return {
-                "actual_seq_lengths": metadata.actual_seq_lengths_q,
-                "actual_seq_lengths_kv": metadata.seq_lens_list,
-                "block_table": None if self.is_non_pa else metadata.block_tables,
+                "actual_seq_lengths": q_lens,
+                "actual_seq_lengths_kv": kv_lens,
+                "block_table": block_table,
             }
         else:
             return {
-                "actual_seq_lengths": metadata.actual_seq_lengths_q,
-                "actual_seq_lengths_kv": metadata.seq_lens_list,
+                "actual_seq_lengths": q_lens,
+                "actual_seq_lengths_kv": kv_lens,
             }
 
 
@@ -545,8 +636,12 @@ class FIAV2ParamProvider:
     def resolve(self, attn_metadata) -> dict[str, Any]:
         metadata = attn_metadata[self.layer_name]
         return {
-            "actual_seq_qlen": metadata.actual_seq_lengths_q,
-            "actual_seq_kvlen": metadata.seq_lens_list,
+            "actual_seq_qlen": metadata.graph_q_lens
+            if metadata.graph_q_lens is not None
+            else metadata.actual_seq_lengths_q,
+            "actual_seq_kvlen": metadata.graph_kv_lens
+            if metadata.graph_kv_lens is not None
+            else metadata.seq_lens_list,
         }
 
 
@@ -673,6 +768,16 @@ class AscendAttentionBackendImpl(AttentionImpl):
         next_tokens = 0 if self.sliding_window else SWA_INT_MAX
         output_view = output[: attn_metadata.num_actual_tokens]
 
+        # With stable buffers every FIA argument sits at a fixed address, so the
+        # captured node is replayable as-is and must not be registered for a
+        # per-step parameter update.
+        stable_params = attn_metadata.graph_q_lens is not None
+        if stable_params:
+            actual_seq_lengths_q = attn_metadata.graph_q_lens
+            actual_seq_lengths_kv = attn_metadata.graph_kv_lens
+            if block_table is not None:
+                block_table = attn_metadata.graph_block_table
+
         extra_args = {}
         if self.enable_c8_quant and layer is not None:
             extra_args = {
@@ -722,35 +827,39 @@ class AscendAttentionBackendImpl(AttentionImpl):
             ),
             use_max_workspace,
         )
-        register_task(
-            torch_npu.npu_fused_infer_attention_score.out,
-            {
-                "query": query,
-                "key": key,
-                "value": value,
-                "atten_mask": attn_mask,
-                "block_table": block_table,
-                "input_layout": input_layout,
-                "block_size": block_size,
-                "actual_seq_lengths": actual_seq_lengths_q,
-                "actual_seq_lengths_kv": actual_seq_lengths_kv,
-                "num_key_value_heads": self.num_kv_heads,
-                "num_heads": self.num_heads,
-                "pre_tokens": pre_tokens,
-                "next_tokens": next_tokens,
-                "scale": self.scale,
-                "sparse_mode": sparse_mode,
-                "workspace": workspace,
-                "out": [output_view, softmax_lse],
-                **extra_args,
-            },
-            FIAParamProvider(
-                self._layer_name,
-                self.sliding_window,
-                _EXTRA_CTX.is_draft_model,
-                is_non_pa=block_table is None,
-            ),
-        )
+        fia_kwargs = {
+            "query": query,
+            "key": key,
+            "value": value,
+            "atten_mask": attn_mask,
+            "block_table": block_table,
+            "input_layout": input_layout,
+            "block_size": block_size,
+            "actual_seq_lengths": actual_seq_lengths_q,
+            "actual_seq_lengths_kv": actual_seq_lengths_kv,
+            "num_key_value_heads": self.num_kv_heads,
+            "num_heads": self.num_heads,
+            "pre_tokens": pre_tokens,
+            "next_tokens": next_tokens,
+            "scale": self.scale,
+            "sparse_mode": sparse_mode,
+            "workspace": workspace,
+            "out": [output_view, softmax_lse],
+            **extra_args,
+        }
+        if stable_params:
+            torch_npu.npu_fused_infer_attention_score.out(**fia_kwargs)
+        else:
+            register_task(
+                torch_npu.npu_fused_infer_attention_score.out,
+                fia_kwargs,
+                FIAParamProvider(
+                    self._layer_name,
+                    self.sliding_window,
+                    _EXTRA_CTX.is_draft_model,
+                    is_non_pa=block_table is None,
+                ),
+            )
         return output, num_tokens
 
     def full_graph_fia_v2(
@@ -770,6 +879,13 @@ class AscendAttentionBackendImpl(AttentionImpl):
         if block_table is None:
             key = key.contiguous()
             value = value.contiguous()
+
+        stable_params = attn_metadata.graph_q_lens is not None
+        if stable_params:
+            actual_seq_lengths_q = attn_metadata.graph_q_lens
+            actual_seq_lengths_kv = attn_metadata.graph_kv_lens
+            if block_table is not None:
+                block_table = attn_metadata.graph_block_table
 
         use_max_workspace = self._use_max_workspace_for_fia_graph
         workspace = get_capture_resource(
@@ -794,30 +910,34 @@ class AscendAttentionBackendImpl(AttentionImpl):
             ),
             use_max_workspace,
         )
-        register_task(
-            torch_npu.npu_fused_infer_attention_score_v2.out,
-            {
-                "query": query,
-                "key": key,
-                "value": value,
-                "atten_mask": attn_metadata.attn_mask,
-                "block_table": block_table,
-                "input_layout": "TND",
-                "block_size": block_size,
-                "actual_seq_qlen": actual_seq_lengths_q,
-                "actual_seq_kvlen": actual_seq_lengths_kv,
-                "num_key_value_heads": self.num_kv_heads,
-                "num_query_heads": self.num_heads,
-                "sparse_mode": 4 if self.sliding_window is not None else 3,
-                "pre_tokens": self.sliding_window if self.sliding_window is not None else SWA_INT_MAX,
-                "next_tokens": 0,
-                "softmax_scale": self.scale,
-                "learnable_sink": self.sinks,
-                "workspace": workspace,
-                "out": [output_view, softmax_lse],
-            },
-            FIAV2ParamProvider(self._layer_name),
-        )
+        fia_v2_kwargs = {
+            "query": query,
+            "key": key,
+            "value": value,
+            "atten_mask": attn_metadata.attn_mask,
+            "block_table": block_table,
+            "input_layout": "TND",
+            "block_size": block_size,
+            "actual_seq_qlen": actual_seq_lengths_q,
+            "actual_seq_kvlen": actual_seq_lengths_kv,
+            "num_key_value_heads": self.num_kv_heads,
+            "num_query_heads": self.num_heads,
+            "sparse_mode": 4 if self.sliding_window is not None else 3,
+            "pre_tokens": self.sliding_window if self.sliding_window is not None else SWA_INT_MAX,
+            "next_tokens": 0,
+            "softmax_scale": self.scale,
+            "learnable_sink": self.sinks,
+            "workspace": workspace,
+            "out": [output_view, softmax_lse],
+        }
+        if stable_params:
+            torch_npu.npu_fused_infer_attention_score_v2.out(**fia_v2_kwargs)
+        else:
+            register_task(
+                torch_npu.npu_fused_infer_attention_score_v2.out,
+                fia_v2_kwargs,
+                FIAV2ParamProvider(self._layer_name),
+            )
         return output, num_tokens
 
     def full_graph_pa(
