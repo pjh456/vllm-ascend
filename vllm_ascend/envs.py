@@ -76,12 +76,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     # model runner and log one aggregated report per 100 steps. Default is 0
     # (disabled). Diagnostic only: it adds a handful of perf_counter calls to a
     # hot path, so leave it disabled outside profiling runs.
-    "VLLM_ASCEND_GRAPH_UPDATE_PROFILE": lambda: bool(int(os.getenv("VLLM_ASCEND_GRAPH_UPDATE_PROFILE", "0"))),
+    "VLLM_ASCEND_GRAPH_UPDATE_PROFILE": lambda: bool(int(os.getenv("VLLM_ASCEND_GRAPH_UPDATE_PROFILE", "1"))),
     # Write the per-step FIA length arguments into fixed-address device buffers
     # for FULL-graph decode, so the captured attention node can be replayed
     # without a per-step UpdatableGraph parameter update. Default is 0
     # (disabled) while it is being validated.
-    "VLLM_ASCEND_STABLE_ATTN_METADATA": lambda: bool(int(os.getenv("VLLM_ASCEND_STABLE_ATTN_METADATA", "0"))),
+    "VLLM_ASCEND_STABLE_ATTN_METADATA": lambda: bool(int(os.getenv("VLLM_ASCEND_STABLE_ATTN_METADATA", "1"))),
 }
 
 # end-env-vars-definition
