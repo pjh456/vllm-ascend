@@ -72,6 +72,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Measure the host-side cost of UpdatableGraph parameter updates on the V2
+    # model runner and log one aggregated report per 100 steps. Default is 0
+    # (disabled). Diagnostic only: it adds a handful of perf_counter calls to a
+    # hot path, so leave it disabled outside profiling runs.
+    "VLLM_ASCEND_GRAPH_UPDATE_PROFILE": lambda: bool(int(os.getenv("VLLM_ASCEND_GRAPH_UPDATE_PROFILE", "0"))),
 }
 
 # end-env-vars-definition
