@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import time
 from collections.abc import Callable, Hashable, Sequence
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, replace
@@ -10,9 +11,64 @@ import torch
 import torch_npu
 from vllm.logger import logger
 
+from vllm_ascend import envs
 from vllm_ascend.utils import weak_ref_tensors
 
 Params = dict[str, Any]
+
+
+class GraphUpdateStats:
+    """Host-side cost of UpdatableGraph parameter updates, per step.
+
+    The V2 model runner re-issues every captured attention op through
+    ``graph_task_update_*`` on each replay. This collects the wall time of that
+    loop so the cost can be attributed to a specific phase instead of guessed
+    at. Disabled unless ``VLLM_ASCEND_GRAPH_UPDATE_PROFILE=1``.
+    """
+
+    LOG_EVERY_STEPS = 100
+
+    def __init__(self, enabled: bool | None = None) -> None:
+        self.enabled = envs.VLLM_ASCEND_GRAPH_UPDATE_PROFILE if enabled is None else enabled
+        self._clear()
+
+    def _clear(self) -> None:
+        self.steps = 0
+        self.tasks = 0
+        self.resolve_s = 0.0
+        self.update_s = 0.0
+        self.begin_s = 0.0
+        self.op_s = 0.0
+        self.end_s = 0.0
+        self.record_s = 0.0
+
+    def add_step(self, resolve_s: float, update_s: float) -> None:
+        self.steps += 1
+        self.resolve_s += resolve_s
+        self.update_s += update_s
+        if self.enabled and self.steps >= self.LOG_EVERY_STEPS:
+            self.report()
+
+    def report(self) -> None:
+        n = self.steps
+        if n == 0:
+            return
+        logger.info(
+            "[graph-update] steps=%d tasks/step=%.1f | resolve %.3f ms/step | "
+            "update %.3f ms/step (begin %.3f, op %.3f, end %.3f, record %.3f)",
+            n,
+            self.tasks / n,
+            1e3 * self.resolve_s / n,
+            1e3 * self.update_s / n,
+            1e3 * self.begin_s / n,
+            1e3 * self.op_s / n,
+            1e3 * self.end_s / n,
+            1e3 * self.record_s / n,
+        )
+        self._clear()
+
+
+GRAPH_UPDATE_STATS = GraphUpdateStats()
 
 
 class ParamProvider(Protocol):
@@ -70,6 +126,23 @@ class GraphUpdateTask:
         return replace(self, kwargs=runtime_kwargs)
 
     def apply(self, update_stream) -> None:
+        stats = GRAPH_UPDATE_STATS
+        if stats.enabled:
+            t0 = time.perf_counter()
+            torch.npu.graph_task_update_begin(update_stream, self.handle)
+            t1 = time.perf_counter()
+            self.operation(**self.kwargs)
+            t2 = time.perf_counter()
+            torch.npu.graph_task_update_end(update_stream)
+            t3 = time.perf_counter()
+            self.event.record(update_stream)
+            t4 = time.perf_counter()
+            stats.begin_s += t1 - t0
+            stats.op_s += t2 - t1
+            stats.end_s += t3 - t2
+            stats.record_s += t4 - t3
+            stats.tasks += 1
+            return
         torch.npu.graph_task_update_begin(update_stream, self.handle)
         self.operation(**self.kwargs)
         torch.npu.graph_task_update_end(update_stream)
@@ -97,6 +170,11 @@ class UpdatableGraph(torch.npu.NPUGraph):
             _ACTIVE_GRAPH.reset(self.capture_token)
             self.capture_token = None
             self.capture_resources = weak_ref_tensors(self.capture_resources)
+            if GRAPH_UPDATE_STATS.enabled:
+                logger.info(
+                    "[graph-update] captured graph with %d update tasks",
+                    len(self.tasks),
+                )
 
     def get_capture_resource(
         self,
