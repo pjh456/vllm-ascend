@@ -215,6 +215,10 @@ class UvaBufferWrapper:
         if requested_real_uva and not self._use_real_uva:
             logger.warning_once("Pinned CPU memory is not mapped for NPU UVA; using the async H2D fallback")
         self._uva: torch.Tensor = view if view is not None else _zeros_on_npu(self._cpu)
+        # Views are either raw (real UVA) or monitored wrappers (emulated path),
+        # so both attributes are explicitly typed as a union.
+        self._cpu_view: torch.Tensor | MonitoredTorchTensor
+        self._np_view: np.ndarray | MonitoredNumPyArray
         if self._use_real_uva:
             self._cpu_view = self._cpu
             self._np_view = self._np
