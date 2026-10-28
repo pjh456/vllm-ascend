@@ -12,7 +12,7 @@ from vllm.v1.request import RequestStatus
 
 from tests.ut.core.test_dyntra_lb_scheduler import create_dyntra_lb_scheduler, make_dyntra_test_config
 from tests.ut.kv_offload.utils import create_model_runner_output, create_request
-from vllm_ascend.core.dyntra_lb_scheduler import DyntraLBPolicyMixin
+from vllm_ascend.core.dyntra_lb_scheduler import DyntraLBPolicyMixin, DyntraLBScheduler
 from vllm_ascend.core.recompute_scheduler import (
     AsyncDyntraLBRecomputeScheduler,
     AsyncRecomputeScheduler,
@@ -21,6 +21,7 @@ from vllm_ascend.core.recompute_scheduler import (
     RecomputeScheduler,
     RecomputeSchedulerConfig,
 )
+from vllm_ascend.core.scheduler_profiling_chunk import ProfilingChunkScheduler
 
 
 @pytest.fixture(autouse=True)
@@ -377,3 +378,32 @@ def test_first_request_preserves_ascend_speculative_padding_without_cached_token
 
     assert output.num_scheduled_tokens[request.request_id] == 3
     assert output.scheduled_spec_decode_tokens[request.request_id] == [-1, -1]
+
+
+@pytest.mark.parametrize(
+    "scheduler_cls",
+    [RecomputeScheduler, DyntraLBScheduler, ProfilingChunkScheduler],
+)
+def test_schedule_accepts_five_value_encoder_input_tuple(scheduler_cls):
+    """vLLM 0.32 returns five values from _try_schedule_encoder_inputs."""
+    config = make_dyntra_test_config()
+    config.kv_transfer_config = None
+    scheduler = create_dyntra_lb_scheduler(config, scheduler_cls=scheduler_cls)
+    request = create_request(request_id=1)
+    scheduler.add_request(request)
+    output = scheduler.schedule()
+    scheduler.update_from_output(output, create_model_runner_output([request]))
+
+    request.mm_features = [MagicMock()]
+    scheduler.encoder_cache_manager.allocate = MagicMock()
+    scheduler.encoder_cache_manager.check_and_update_cache = MagicMock()
+
+    def fake_try_schedule(_request, _num_computed, num_new_tokens, budget, **_kwargs):
+        # 1 new encoder input, 1 duplicate already present in the cache.
+        return [0], num_new_tokens, budget, [], [0]
+
+    with patch.object(Scheduler, "_try_schedule_encoder_inputs", side_effect=fake_try_schedule):
+        scheduler.schedule()
+
+    scheduler.encoder_cache_manager.allocate.assert_called_once_with(request, 0)
+    scheduler.encoder_cache_manager.check_and_update_cache.assert_called_once_with(request, 0)
