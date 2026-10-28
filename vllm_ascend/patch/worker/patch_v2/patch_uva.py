@@ -116,6 +116,8 @@ class _DirtyRows:
             index = int(rows)
             if index < 0:
                 index += self._size
+            if index < 0 or index >= self._size:
+                raise IndexError(f"row index {rows} out of [0, {self._size})")
             if index == self._prefix:
                 self._prefix += 1
                 self._count += 1

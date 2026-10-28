@@ -10,6 +10,7 @@ contiguous-prefix writes and still copy scattered writes correctly.
 """
 
 import numpy as np
+import pytest
 import torch
 
 from vllm_ascend.patch.worker.patch_v2.patch_uva import (
@@ -94,6 +95,25 @@ def test_take_resets_the_tracker():
 
     assert dirty.take() == [(0, 4)]
     assert dirty.take() == []
+
+
+def test_out_of_bounds_index_is_rejected():
+    dirty = _DirtyRows(8)
+
+    with pytest.raises(IndexError):
+        dirty.mark(-10)
+    with pytest.raises(IndexError):
+        dirty.mark(8)
+
+    assert dirty.take() == []
+
+
+def test_negative_index_within_bounds_is_resolved():
+    dirty = _DirtyRows(8)
+
+    dirty.mark(-1)
+
+    assert dirty.take() == [(7, 8)]
 
 
 def test_empty_tuple_key_marks_the_whole_buffer():
