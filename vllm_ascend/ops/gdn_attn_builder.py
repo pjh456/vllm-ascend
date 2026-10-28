@@ -517,11 +517,11 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             # A graph bucket pads the speculative query to the captured token
             # count, while the recurrent kernel takes T from actual_seq_lengths
             # and requires len(ssm_state_indices) == T. Attribute the padding
-            # rows to the last sequence; they land in that sequence's trailing
-            # unscheduled draft slots, or in the graph pad slot when the rows
-            # belong to a dummy request.
+            # rows to the last sequence so T covers every query row; the
+            # runtime maps those rows to the null state slot, so no live
+            # recurrent state is read or written for them.
             padding_tokens = attn_metadata.num_actual_tokens - attn_metadata.num_spec_decode_tokens
-            if padding_tokens > 0:
+            if padding_tokens > 0 and num_sequences > 0:
                 actual_seq_lengths[num_sequences].add_(padding_tokens)
 
         attn_metadata.spec_decode_metadata = GDNSpecDecodeMetadata(

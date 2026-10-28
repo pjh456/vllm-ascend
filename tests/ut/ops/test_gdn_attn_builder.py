@@ -826,6 +826,37 @@ def test_spec_actual_seq_lengths_cover_graph_padded_query_rows(padded_tokens):
     assert int(actual_seq_lengths.sum()) == attn_metadata.num_actual_tokens
 
 
+def test_spec_actual_seq_lengths_attach_padding_to_the_last_sequence():
+    """Padding rows follow the last sequence even when it used all its slots."""
+    batch_spec = BatchSpec(seq_lens=[8, 8], query_lens=[3, 4], name="padded_tail_sequence")
+    common_attn_metadata = create_common_attn_metadata(
+        batch_spec=batch_spec,
+        block_size=16,
+        device=torch.device("cpu"),
+    )
+    common_attn_metadata.block_table_tensor = torch.tensor(
+        [[10, 11, 12, 13], [20, 21, 22, 23]],
+        dtype=torch.int32,
+    )
+    common_attn_metadata.num_actual_tokens += 1
+    builder = _make_builder(
+        device=torch.device("cpu"),
+        num_heads=32,
+        num_speculative_tokens=3,
+    )
+
+    attn_metadata = builder.build(
+        0,
+        common_attn_metadata,
+        num_accepted_tokens=torch.tensor([1, 2], dtype=torch.int32),
+        num_decode_draft_tokens_cpu=torch.tensor([2, 3], dtype=torch.int32),
+    )
+
+    actual_seq_lengths = attn_metadata.spec_decode_metadata.actual_seq_lengths
+    assert actual_seq_lengths.tolist() == [0, batch_spec.query_lens[0], batch_spec.query_lens[1] + 1]
+    assert int(actual_seq_lengths.sum()) == attn_metadata.num_actual_tokens
+
+
 def test_spec_actual_seq_lengths_keep_scheduled_tokens_for_mixed_batches():
     """Mixed batches compact the speculative query, so no padding is added."""
     batch_spec = BatchSpec(seq_lens=[8, 64], query_lens=[3, 32], name="mixed_spec_query_rows")
