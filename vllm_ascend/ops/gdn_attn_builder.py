@@ -504,21 +504,33 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             actual_seq_lengths_buffer = self.spec_actual_seq_lengths
         spec_num_rows = attn_metadata.spec_query_start_loc.size(0) - 1
 
+        actual_seq_lengths = (
+            _build_actual_seq_lengths(
+                attn_metadata.spec_query_start_loc,
+                num_sequences,
+                actual_seq_lengths_buffer,
+            )
+            if self._USE_COMMON_KERNEL_METADATA
+            else None
+        )
+        if actual_seq_lengths is not None and attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
+            # A graph bucket pads the speculative query to the captured token
+            # count, while the recurrent kernel takes T from actual_seq_lengths
+            # and requires len(ssm_state_indices) == T. Attribute the padding
+            # rows to the last sequence; they land in that sequence's trailing
+            # unscheduled draft slots, or in the graph pad slot when the rows
+            # belong to a dummy request.
+            padding_tokens = attn_metadata.num_actual_tokens - attn_metadata.num_spec_decode_tokens
+            if padding_tokens > 0:
+                actual_seq_lengths[num_sequences].add_(padding_tokens)
+
         attn_metadata.spec_decode_metadata = GDNSpecDecodeMetadata(
             spec_causal_conv1d=GDNSpecCausalConv1dMetadata(
                 query_start_loc=attn_metadata.spec_query_start_loc,
                 cache_indices=attn_metadata.spec_state_indices_tensor[:spec_num_rows],
                 num_accepted_tokens=attn_metadata.num_accepted_tokens[:spec_num_rows],
             ),
-            actual_seq_lengths=(
-                _build_actual_seq_lengths(
-                    attn_metadata.spec_query_start_loc,
-                    num_sequences,
-                    actual_seq_lengths_buffer,
-                )
-                if self._USE_COMMON_KERNEL_METADATA
-                else None
-            ),
+            actual_seq_lengths=actual_seq_lengths,
         )
         return attn_metadata
 

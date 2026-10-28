@@ -790,6 +790,72 @@ def test_full_graph_spec_actual_seq_lengths_use_padded_builder_buffer():
     )
 
 
+@pytest.mark.parametrize("padded_tokens", [1, 4])
+def test_spec_actual_seq_lengths_cover_graph_padded_query_rows(padded_tokens):
+    """The recurrent kernel needs T == len(ssm_state_indices) == query rows.
+
+    A decode step clamped by max_model_len schedules fewer than
+    num_spec + 1 tokens, and a graph bucket pads the query back up to the
+    captured token count. The padding rows carry no scheduled token, so they
+    must be attributed to the last sequence instead of being left out of T.
+    """
+    batch_spec = BatchSpec(seq_lens=[8], query_lens=[3], name="padded_spec_query_rows")
+    common_attn_metadata = create_common_attn_metadata(
+        batch_spec=batch_spec,
+        block_size=16,
+        device=torch.device("cpu"),
+    )
+    common_attn_metadata.block_table_tensor = torch.tensor([[10, 11, 12, 13]], dtype=torch.int32)
+    # Mirror the runner: the graph bucket always hands over its full token count.
+    common_attn_metadata.num_actual_tokens += padded_tokens
+    builder = _make_builder(
+        device=torch.device("cpu"),
+        num_heads=32,
+        num_speculative_tokens=3,
+    )
+
+    attn_metadata = builder.build(
+        0,
+        common_attn_metadata,
+        num_accepted_tokens=torch.tensor([1], dtype=torch.int32),
+        num_decode_draft_tokens_cpu=torch.tensor([2], dtype=torch.int32),
+    )
+
+    actual_seq_lengths = attn_metadata.spec_decode_metadata.actual_seq_lengths
+    assert actual_seq_lengths.tolist() == [0, batch_spec.query_lens[0] + padded_tokens]
+    assert int(actual_seq_lengths.sum()) == attn_metadata.num_actual_tokens
+
+
+def test_spec_actual_seq_lengths_keep_scheduled_tokens_for_mixed_batches():
+    """Mixed batches compact the speculative query, so no padding is added."""
+    batch_spec = BatchSpec(seq_lens=[8, 64], query_lens=[3, 32], name="mixed_spec_query_rows")
+    common_attn_metadata = create_common_attn_metadata(
+        batch_spec=batch_spec,
+        block_size=16,
+        device=torch.device("cpu"),
+    )
+    common_attn_metadata.block_table_tensor = torch.tensor(
+        [[10, 11, 12, 13], [20, 21, 22, 23]],
+        dtype=torch.int32,
+    )
+    builder = _make_builder(
+        device=torch.device("cpu"),
+        num_heads=32,
+        num_speculative_tokens=3,
+    )
+
+    attn_metadata = builder.build(
+        0,
+        common_attn_metadata,
+        num_accepted_tokens=torch.tensor([1], dtype=torch.int32),
+        num_decode_draft_tokens_cpu=torch.tensor([2, -1], dtype=torch.int32),
+    )
+
+    actual_seq_lengths = attn_metadata.spec_decode_metadata.actual_seq_lengths
+    assert actual_seq_lengths.tolist() == [0, batch_spec.query_lens[0]]
+    assert attn_metadata.num_actual_tokens == sum(batch_spec.query_lens)
+
+
 def test_full_graph_non_spec_actual_seq_lengths_use_padded_builder_buffer():
     batch_spec = BatchSpec(
         seq_lens=[1, 1],
