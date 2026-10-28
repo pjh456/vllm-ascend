@@ -96,6 +96,32 @@ def test_take_resets_the_tracker():
     assert dirty.take() == []
 
 
+def test_empty_tuple_key_marks_the_whole_buffer():
+    # ``arr[()] = value`` is NumPy's "everything" index.
+    dirty = _DirtyRows(8)
+
+    dirty.mark(())
+
+    assert dirty.take() == [(0, 8)]
+
+
+def test_negative_step_slice_marks_the_reversed_rows():
+    dirty = _DirtyRows(8)
+    rows = slice(5, 2, -1)  # rows 5, 4, 3
+
+    dirty.mark(rows)
+
+    assert dirty.take() == [(3, 6)]
+
+
+def test_empty_negative_step_slice_marks_nothing():
+    dirty = _DirtyRows(8)
+
+    dirty.mark(slice(2, 5, -1))
+
+    assert dirty.take() == []
+
+
 def test_numpy_write_reaches_the_device_shadow():
     buf = _fake_buffer(8)
 

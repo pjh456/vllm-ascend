@@ -82,13 +82,26 @@ class _DirtyRows:
 
     def mark(self, key) -> None:
         """Record the rows touched by an ``arr[key] = value`` write."""
-        rows = key[0] if isinstance(key, tuple) and key else key
+        if isinstance(key, tuple):
+            if not key:
+                # ``arr[()] = value`` addresses the whole buffer in NumPy.
+                self._mark_whole()
+                return
+            rows = key[0]
+        else:
+            rows = key
         if rows is None or rows is Ellipsis:
-            self._count += self._size
-            self._prefix = self._size
+            self._mark_whole()
             return
         if isinstance(rows, slice):
             start, stop, step = rows.indices(self._size)
+            if step < 0:
+                # A negative step can never extend the prefix, and an empty
+                # one must not be confused with a reversed range.
+                if stop >= start:
+                    return
+                self._mark_rows(np.arange(start, stop, step))
+                return
             if stop <= start:
                 return
             if step == 1 and start <= self._prefix:
@@ -112,6 +125,10 @@ class _DirtyRows:
                 self._mark_rows(np.array([index], dtype=np.intp))
             return
         self._mark_rows(rows if isinstance(rows, np.ndarray) else np.asarray(rows))
+
+    def _mark_whole(self) -> None:
+        self._count += self._size
+        self._prefix = self._size
 
     def _mark_rows(self, rows: np.ndarray) -> None:
         if self._mask is None:
