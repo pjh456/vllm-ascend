@@ -175,6 +175,9 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         # No LoRA request, so return directly
         if self.no_lora:
             return
+        if self._needs_expand_fallback(x.size(-1), y_slice_size):
+            self._expand_slice_fallback(y, x, w_t_all, y_offset, y_slice_size, add_inputs)
+            return
         self.sgmv_expand_slice(
             x,
             w_t_all,
@@ -194,6 +197,9 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         y_slice_size: int,
         add_inputs: bool,
     ):
+        if self._needs_expand_fallback(x.size(-1), y_slice_size):
+            self._expand_slice_fallback(y, x, w_t_all, y_offset, y_slice_size, add_inputs)
+            return
         self.bgmv_expand_slice(
             x,
             w_t_all,
@@ -203,6 +209,65 @@ class PunicaWrapperNPU(PunicaWrapperBase):
             y_slice_size,
             add_inputs,
         )
+
+    @staticmethod
+    def _needs_expand_fallback(rank: int, y_slice_size: int) -> bool:
+        """Whether the Ascend expand kernels cannot handle this slice.
+
+        sgmv/bgmv expand require ``hidden_in < hidden_out``. Packed GDN
+        projections such as ``in_proj_ba`` have per-slice outputs smaller than
+        the LoRA rank once tensor parallelism is applied (for example 48 value
+        heads with tp=4 leaves 12 outputs per rank, while the rank buffer is
+        ``max_lora_rank``). Such a slice is normally only touched by the dummy
+        adapter used for warmup/cudagraph capture.
+        """
+        return rank >= y_slice_size
+
+    def _expand_slice_fallback(
+        self,
+        y: torch.Tensor,
+        x: torch.Tensor,
+        w_t_all: torch.Tensor,
+        y_offset: int,
+        y_slice_size: int,
+        add_inputs: bool,
+    ) -> None:
+        """Expand one LoRA slice with a plain batched matmul.
+
+        Keeps static shapes (``index_select`` + ``bmm``) and never reads
+        indices back to the host, so the computation stays cudagraph-safe.
+        Tokens mapped to slot -1 (no adapter) keep the base output.
+        """
+        out = y[..., y_offset : y_offset + y_slice_size]
+        if out.size(-1) != y_slice_size:
+            # A packed wrapper can hand over a partition that is narrower than
+            # the sum of its output slices while still listing every slice.
+            # Writing would go out of bounds, so skip the slice instead. This
+            # only happens for tiny packed projections such as in_proj_ba.
+            if not getattr(self, "_expand_slice_skip_logged", False):
+                self._expand_slice_skip_logged = True
+                print(
+                    "[lora] skip out-of-range expand slice: "
+                    f"y={tuple(y.shape)} ndim={y.ndim} offset={y_offset} "
+                    f"size={y_slice_size} rank={x.size(-1)}",
+                    flush=True,
+                )
+            return
+
+        # w_t_all already holds only this slice (one entry per output_slice),
+        # so y_offset applies to the output tensor only.
+        indices = self._get_token_lora_indices(x)
+        safe_indices = indices.clamp_min(0)
+        weight = w_t_all[:, 0].to(torch.float32)
+        x = x.to(torch.float32)
+        delta = torch.bmm(
+            x.unsqueeze(1),
+            weight.index_select(0, safe_indices).transpose(1, 2),
+        ).squeeze(1)
+        delta = delta * (indices >= 0).unsqueeze(1)
+
+        delta = delta.to(out.dtype)
+        out.copy_(out + delta if add_inputs else delta)
 
     def _get_token_lora_indices(self, x: torch.Tensor) -> torch.Tensor:
         return torch.narrow(self._token_lora_indices, 0, 0, x.size(0))
