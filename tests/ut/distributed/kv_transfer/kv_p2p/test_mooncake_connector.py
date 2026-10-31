@@ -4960,6 +4960,7 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
             remote_ptp_size=8,
             remote_multi_nodes_meta_mapping={},
             remote_block_size=16,
+            remote_block_sizes=(),
             local_block_ids=([10], [20]),
             remote_block_ids=([30], [40]),
             num_computed_tokens=0,
