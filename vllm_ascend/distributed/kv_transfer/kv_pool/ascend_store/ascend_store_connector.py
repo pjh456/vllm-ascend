@@ -166,8 +166,11 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         self._mamba_state: Any = None
         self._loaded_layer: int | None = None
         self.requires_mamba_state_copy_after_layer_load = self.use_layerwise
-        # Opt in only for synchronous bulk loads, not background retrieval.
-        self.requires_mamba_state_copy_after_load = not self.use_layerwise and not extra_config.get("load_async", False)
+        # Defer the Mamba bulk copy behind pre_forward for every non-layerwise
+        # load. Async retrievals complete before the request is scheduled, and
+        # pre_forward is a no-op there, so enabling the deferral for them costs
+        # nothing while keeping the #18898 ordering for sync and async alike.
+        self.requires_mamba_state_copy_after_load = not self.use_layerwise
 
         self.connector_scheduler: KVPoolScheduler | None = None
         self.connector_worker: KVPoolWorker | None = None
